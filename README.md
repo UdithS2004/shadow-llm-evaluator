@@ -49,58 +49,123 @@ pip install -r requirements.txt
 ## Run the API
 
 ```bash
-uvicorn app.main:app --reload
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-## Example Request
+Open the browser docs:
 
-```bash
-curl -s -X POST http://127.0.0.1:8000/generate \
-  -H "Content-Type: application/json" \
-  -d '{"prompt":"hello"}' | jq
+```text
+http://127.0.0.1:8000/docs
 ```
 
-Example response:
+## Endpoints
+
+```text
+POST /generate
+GET  /metrics
+POST /mock/primary
+POST /mock/candidate
+```
+
+## Demo 1: Normal Request
 
 ```json
 {
-  "request_id": "example-request-id",
-  "primary_response": {
-    "model": "primary",
-    "output": {
-      "answer": "HELLO"
-    }
+  "prompt": "hello"
+}
+```
+
+Expected Primary response:
+
+```json
+{
+  "model": "primary",
+  "output": {
+    "answer": "HELLO"
   }
 }
 ```
 
-## Force a Mismatch
+Then check:
 
-```bash
-curl -s -X POST http://127.0.0.1:8000/generate \
-  -H "Content-Type: application/json" \
-  -d '{"prompt":"hello","force_mismatch":true}' | jq
+```text
+GET /metrics
 ```
 
-The Primary response still returns to the client. The Candidate response differs in the background, so a mismatch is logged and the mismatch count increases.
+`matches` should increase.
 
-## Simulate a Slow Candidate
+## Demo 2: Forced Mismatch
 
-```bash
-time curl -s -X POST http://127.0.0.1:8000/generate \
-  -H "Content-Type: application/json" \
-  -d '{"prompt":"slow test","candidate_delay":2}' | jq
+```json
+{
+  "prompt": "hello",
+  "force_mismatch": true
+}
 ```
 
-The response should return quickly even though the Candidate mock sleeps for 2 seconds.
+The client still receives the Primary response:
 
-## Metrics
-
-```bash
-curl -s http://127.0.0.1:8000/metrics | jq
+```json
+{
+  "answer": "HELLO"
+}
 ```
 
-Example response:
+The Candidate returns:
+
+```json
+{
+  "answer": "HELLO!"
+}
+```
+
+Then check:
+
+```text
+GET /metrics
+```
+
+`mismatches` should increase.
+
+## Demo 3: Slow Candidate
+
+```json
+{
+  "prompt": "slow test",
+  "candidate_delay": 2
+}
+```
+
+The Candidate sleeps for 2 seconds in the background, but `/generate` still returns quickly with:
+
+```json
+{
+  "answer": "SLOW TEST"
+}
+```
+
+This proves Candidate latency does not delay the Primary response.
+
+## Demo 4: Candidate Failure
+
+```json
+{
+  "prompt": "hello",
+  "force_candidate_error": true
+}
+```
+
+The client still receives the Primary response. The Candidate failure is handled in the background.
+
+Then check:
+
+```text
+GET /metrics
+```
+
+`candidate_failures` should increase.
+
+## Metrics Example
 
 ```json
 {
@@ -113,30 +178,50 @@ Example response:
 }
 ```
 
-## Testing
+## Run Tests
 
 ```bash
 pytest
 ```
 
-The integration test verifies that `/generate` returns quickly even when the Candidate model is slow.
-
-## Architecture
-
-See [docs/architecture.md](docs/architecture.md).
-
-## Decoupling Explanation
-
-The `/generate` endpoint awaits only `call_primary_llm(payload)`. Once the Primary response is available, the service creates a copied background job containing only:
+Expected:
 
 ```text
-request_id
-payload
-primary_response
+18 passed
 ```
 
-That job is pushed into an `asyncio.Queue` with `put_nowait`.
+## Key Implementation Details
 
-A background worker started during FastAPI lifespan consumes jobs from the queue and calls the Candidate LLM. The worker does not receive the FastAPI `Request` object and does not depend on the client HTTP connection staying open.
+`/generate` waits only for the Primary LLM:
 
-This design ensures that Candidate latency or failure cannot delay the Primary response.
+```python
+primary_response = await call_primary_llm(payload)
+```
+
+Then it copies the payload, request ID, and Primary response into a queue job:
+
+```python
+shadow_queue.put_nowait(job)
+```
+
+The Candidate LLM runs later in `app/background.py`.
+
+The worker compares only the `output` fields, because model metadata like `"primary"` and `"candidate"` is expected to differ.
+
+JSON outputs are extracted and normalized before comparison so formatting differences, markdown fences, and key order do not cause false mismatches.
+
+## Production Notes
+
+This interview version uses an in-memory `asyncio.Queue` and in-memory metrics.
+
+For production, I would add:
+
+```text
+Durable queue: Redis, SQS, Kafka, or Celery
+Persistent mismatch storage
+Structured logging
+LLM timeouts and retries
+Authentication and rate limiting
+Prometheus metrics
+Shared metrics backend for multi-instance deployments
+```
